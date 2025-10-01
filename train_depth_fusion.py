@@ -20,52 +20,59 @@ class DepthFusionTrainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
         
-        # 损失函数：MSE
-        self.criterion = nn.MSELoss()
+        # 改进的损失函数
+        from src.losses import CombinedLoss
+        self.criterion = CombinedLoss(mse_weight=0.7, mae_weight=0.3)
         
-        # 优化器：Adam
-        self.optimizer = optim.Adam(
+        # 优化器：使用AdamW
+        self.optimizer = optim.AdamW(
             model.parameters(), 
             lr=0.001,
-            weight_decay=1e-5
+            weight_decay=0.01,  # L2正则化
+            betas=(0.9, 0.999)
         )
         
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        # 改进的学习率调度
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=3
+            T_0=10,      # 10个epoch后第一次重启
+            T_mult=2,    # 每次重启周期翻倍
+            eta_min=1e-6
         )
         
         # 训练历史
         self.history = {
             'train_loss': [],
+            'train_mse': [],
+            'train_mae': [],
             'val_loss': [],
+            'val_mse': [],
+            'val_mae': [],
             'lr': []
         }
         
         # 早停
         self.best_val_loss = float('inf')
         self.patience_counter = 0
-        self.patience = 4
+        self.patience = 8  # 增加耐心
         
     def train_epoch(self):
         """训练一个epoch"""
         self.model.train()
         total_loss = 0
+        total_mse = 0
+        total_mae = 0
         num_batches = len(self.train_loader)
         
         with tqdm(self.train_loader, desc='Training') as pbar:
             for batch in pbar:
-                # 获取数据
                 rgb = batch['image'].to(self.device)
                 depth = batch['depth'].to(self.device)
                 targets = batch['calories'].to(self.device).unsqueeze(1)
                 
                 # 前向传播
                 outputs = self.model(rgb, depth)
-                loss = self.criterion(outputs, targets)
+                loss, loss_dict = self.criterion(outputs, targets)
                 
                 # 反向传播
                 self.optimizer.zero_grad()
@@ -75,14 +82,27 @@ class DepthFusionTrainer:
                 
                 # 记录
                 total_loss += loss.item()
-                pbar.set_postfix({'loss': loss.item()})
+                total_mse += loss_dict['mse']
+                total_mae += loss_dict['mae']
+                
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.3f}",
+                    'mse': f"{loss_dict['mse']:.3f}",
+                    'mae': f"{loss_dict['mae']:.2f}"
+                })
         
-        return total_loss / num_batches
+        return {
+            'loss': total_loss / num_batches,
+            'mse': total_mse / num_batches,
+            'mae': total_mae / num_batches
+        }
     
     def validate(self):
         """验证"""
         self.model.eval()
         total_loss = 0
+        total_mse = 0
+        total_mae = 0
         num_batches = len(self.val_loader)
         
         with torch.no_grad():
@@ -92,11 +112,17 @@ class DepthFusionTrainer:
                 targets = batch['calories'].to(self.device).unsqueeze(1)
                 
                 outputs = self.model(rgb, depth)
-                loss = self.criterion(outputs, targets)
+                loss, loss_dict = self.criterion(outputs, targets)
                 
                 total_loss += loss.item()
+                total_mse += loss_dict['mse']
+                total_mae += loss_dict['mae']
         
-        return total_loss / num_batches
+        return {
+            'loss': total_loss / num_batches,
+            'mse': total_mse / num_batches,
+            'mae': total_mae / num_batches
+        }
     
     def train(self, num_epochs):
         """完整训练流程"""
@@ -108,34 +134,36 @@ class DepthFusionTrainer:
         for epoch in range(num_epochs):
             start_time = time.time()
             
-            train_loss = self.train_epoch()
-            val_loss = self.validate()
+            train_metrics = self.train_epoch()
+            val_metrics = self.validate()
             
-            old_lr = self.optimizer.param_groups[0]['lr']
-            self.scheduler.step(val_loss)
+            # 更新学习率
+            self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            if current_lr != old_lr:
-                print(f"  学习率降低: {old_lr:.6f} -> {current_lr:.6f}")
-            
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
+            # 记录历史
+            self.history['train_loss'].append(train_metrics['loss'])
+            self.history['train_mse'].append(train_metrics['mse'])
+            self.history['train_mae'].append(train_metrics['mae'])
+            self.history['val_loss'].append(val_metrics['loss'])
+            self.history['val_mse'].append(val_metrics['mse'])
+            self.history['val_mae'].append(val_metrics['mae'])
             self.history['lr'].append(current_lr)
             
-            train_rmse = train_loss ** 0.5
-            val_rmse = val_loss ** 0.5
             elapsed = time.time() - start_time
             
+            # 打印
             print(f"\nEpoch {epoch+1}/{num_epochs} ({elapsed:.1f}s)")
-            print(f"  Train Loss: {train_loss:.4f} (RMSE: {train_rmse:.2f})")
-            print(f"  Val Loss:   {val_loss:.4f} (RMSE: {val_rmse:.2f})")
+            print(f"  Train - Loss: {train_metrics['loss']:.4f}, MSE: {train_metrics['mse']:.4f}, MAE: {train_metrics['mae']:.2f}")
+            print(f"  Val   - Loss: {val_metrics['loss']:.4f}, MSE: {val_metrics['mse']:.4f}, MAE: {val_metrics['mae']:.2f}")
             print(f"  LR: {current_lr:.6f}")
             
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+            # 保存最佳模型
+            if val_metrics['loss'] < self.best_val_loss:
+                self.best_val_loss = val_metrics['loss']
                 self.patience_counter = 0
-                self.save_checkpoint('best_model.pth', epoch, val_loss)
-                print(f"  ✓ 保存最佳模型 (val_loss: {val_loss:.4f})")
+                self.save_checkpoint('best_model.pth', epoch, val_metrics['loss'])
+                print(f"  ✓ 保存最佳模型")
             else:
                 self.patience_counter += 1
                 print(f"  验证集未改善 ({self.patience_counter}/{self.patience})")
@@ -146,7 +174,7 @@ class DepthFusionTrainer:
             
             print("-" * 50)
         
-        self.save_checkpoint('final_model.pth', epoch, val_loss)
+        self.save_checkpoint('final_model.pth', epoch, val_metrics['loss'])
         self.save_history()
         self.plot_training_curves()
         
@@ -171,22 +199,42 @@ class DepthFusionTrainer:
     def plot_training_curves(self):
         epochs = range(1, len(self.history['train_loss']) + 1)
         
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         
-        axes[0].plot(epochs, self.history['train_loss'], label='Train Loss', marker='o')
-        axes[0].plot(epochs, self.history['val_loss'], label='Val Loss', marker='s')
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('MSE Loss')
-        axes[0].set_title('Training and Validation Loss')
-        axes[0].legend()
-        axes[0].grid(alpha=0.3)
+        # 组合损失
+        axes[0, 0].plot(epochs, self.history['train_loss'], label='Train', marker='o')
+        axes[0, 0].plot(epochs, self.history['val_loss'], label='Val', marker='s')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Combined Loss')
+        axes[0, 0].set_title('Combined Loss (0.7*MSE + 0.3*MAE)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(alpha=0.3)
         
-        axes[1].plot(epochs, self.history['lr'], marker='o', color='green')
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Learning Rate')
-        axes[1].set_title('Learning Rate Schedule')
-        axes[1].set_yscale('log')
-        axes[1].grid(alpha=0.3)
+        # MSE
+        axes[0, 1].plot(epochs, self.history['train_mse'], label='Train MSE', marker='o')
+        axes[0, 1].plot(epochs, self.history['val_mse'], label='Val MSE', marker='s')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('MSE')
+        axes[0, 1].set_title('Mean Squared Error')
+        axes[0, 1].legend()
+        axes[0, 1].grid(alpha=0.3)
+        
+        # MAE
+        axes[1, 0].plot(epochs, self.history['train_mae'], label='Train MAE', marker='o')
+        axes[1, 0].plot(epochs, self.history['val_mae'], label='Val MAE', marker='s')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('MAE (kcal)')
+        axes[1, 0].set_title('Mean Absolute Error')
+        axes[1, 0].legend()
+        axes[1, 0].grid(alpha=0.3)
+        
+        # 学习率
+        axes[1, 1].plot(epochs, self.history['lr'], marker='o', color='green')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Learning Rate')
+        axes[1, 1].set_title('Learning Rate Schedule')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].grid(alpha=0.3)
         
         plt.tight_layout()
         plt.savefig(self.save_dir / 'training_curves.png', dpi=150)
@@ -198,7 +246,7 @@ def main():
     DATA_ROOT = Path('Nutrition5K/Nutrition5K')
     TRAIN_CSV = DATA_ROOT / 'nutrition5k_train_clean.csv'
     BATCH_SIZE = 32
-    NUM_EPOCHS = 30
+    NUM_EPOCHS = 50
     IMAGE_SIZE = 224
     FUSION_METHOD = 'concat'  # 可选：'concat', 'add', 'attention'
     

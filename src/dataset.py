@@ -35,36 +35,56 @@ class Nutrition5kDataset(Dataset):
     def __len__(self):
         return len(self.df)
     
+
+
     def __getitem__(self, idx):
-        # 获取样本信息
         row = self.df.iloc[idx]
         dish_id = row['ID']
         
-        # 加载RGB图像
+        # 加载RGB
         rgb_path = self.rgb_dir / dish_id / 'rgb.png'
         rgb = Image.open(rgb_path).convert('RGB')
         
-        # 应用变换
         if self.transform:
             rgb = self.transform(rgb)
         
-        # 准备返回值
         sample = {
             'image': rgb,
             'dish_id': dish_id
         }
         
-        # 如果是训练集，添加标签
         if 'Value' in row:
             sample['calories'] = torch.tensor(row['Value'], dtype=torch.float32)
         
-        # 如果使用深度图（baseline暂时不用）
+        # 加载深度图（改进版本）
         if self.use_depth:
             depth_path = self.depth_dir / dish_id / 'depth_raw.png'
-            depth = Image.open(depth_path)
-            depth = np.array(depth, dtype=np.float32) / 10000.0  # 转为米
-            depth = torch.from_numpy(depth).unsqueeze(0)  # (1, H, W)
-            sample['depth'] = depth
+            
+            try:
+                depth = Image.open(depth_path)
+                depth_array = np.array(depth, dtype=np.float32)
+                
+                # 先resize再归一化
+                depth_pil = Image.fromarray(depth_array, mode='F')
+                depth_resized = depth_pil.resize((224, 224), Image.BILINEAR)
+                depth_array = np.array(depth_resized, dtype=np.float32)
+                
+                # 改进归一化：基于数据集统计
+                depth_array = depth_array / 10000.0  # 转为米
+                depth_array = np.clip(depth_array, 0, 0.7)  # 裁剪异常值
+                
+                # 标准化到[-1, 1]范围
+                depth_mean = 0.35  # 估计的深度均值
+                depth_std = 0.15   # 估计的深度标准差
+                depth_array = (depth_array - depth_mean) / depth_std
+                
+                depth_tensor = torch.from_numpy(depth_array).unsqueeze(0).float()
+                
+            except Exception as e:
+                print(f"Warning: Failed to load depth for {dish_id}: {e}")
+                depth_tensor = torch.zeros(1, 224, 224, dtype=torch.float32)
+            
+            sample['depth'] = depth_tensor
         
         return sample
 
