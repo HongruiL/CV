@@ -4,3 +4,6 @@ Nutrition5K/
 # 忽略中文文件
 步骤
 report
+
+# Ignore PyTorch model checkpoints
+checkpoints/
