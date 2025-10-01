@@ -9,28 +9,30 @@ import torchvision.transforms as transforms
 class Nutrition5kDataset(Dataset):
     """
     Nutrition5K 数据集加载器
-    
+
     Args:
         csv_file: CSV文件路径，包含ID和Value列
         data_root: 数据根目录
         split: 'train' 或 'test'
         transform: 图像变换
         use_depth: 是否使用深度图（默认False，baseline只用RGB）
+        use_log_transform: 是否使用log变换（默认False）
     """
     def __init__(self, csv_file, data_root, split='train',
-                 transform=None, use_depth=False):
+                 transform=None, use_depth=False, use_log_transform=False):
         self.df = pd.read_csv(csv_file)
         self.data_root = Path(data_root)
         self.split = split
         self.transform = transform
         self.use_depth = use_depth
-        
+        self.use_log_transform = use_log_transform  # 新增
+
         # 构建图像路径
         self.rgb_dir = self.data_root / split / 'color'
         if use_depth:
             self.depth_dir = self.data_root / split / 'depth_raw'
-        
-        print(f"加载 {split} 数据集: {len(self.df)} 个样本")
+
+        print(f"加载 {split} 数据集: {len(self.df)} 个样本 (log_transform={use_log_transform})")
         
     def __len__(self):
         return len(self.df)
@@ -49,7 +51,13 @@ class Nutrition5kDataset(Dataset):
         }
 
         if 'Value' in row:
-            sample['calories'] = torch.tensor(row['Value'], dtype=torch.float32)
+            calories = row['Value']
+
+            # 应用log变换
+            if self.use_log_transform:
+                calories = np.log1p(calories)
+
+            sample['calories'] = torch.tensor(calories, dtype=torch.float32)
 
         # 深度图特殊处理
         if self.use_depth:
@@ -65,9 +73,9 @@ class Nutrition5kDataset(Dataset):
             # 转为numpy并归一化
             depth = np.array(depth, dtype=np.float32)
 
-            # 检查并归一化到[0,1]
+            # 简单的归一化（回退）
             if depth.max() > 0:
-                depth = depth / depth.max()
+                depth = depth / depth.max()  # 不用98百分位
 
             depth = torch.from_numpy(depth).unsqueeze(0)  # (1, H, W)
             sample['depth'] = depth
@@ -84,16 +92,16 @@ def get_transforms(split='train', image_size=224):
         image_size: 目标图像尺寸
     """
     if split == 'train':
-        # 训练集：数据增强
+        # 训练集：数据增强（减少强度以提高稳定性）
         return transforms.Compose([
             transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),  # 50%概率水平翻转
-            transforms.RandomRotation(degrees=15),    # ±15度旋转
-            transforms.ColorJitter(                   # 色彩抖动
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.1
+            transforms.RandomHorizontalFlip(p=0.3),  # 从0.5降到0.3
+            transforms.RandomRotation(degrees=10),    # 从15降到10
+            transforms.ColorJitter(                   # 减少增强强度
+                brightness=0.15,  # 从0.2降到0.15
+                contrast=0.15,    # 减少增强强度
+                saturation=0.15,
+                hue=0.05
             ),
             transforms.ToTensor(),
             transforms.Normalize(
