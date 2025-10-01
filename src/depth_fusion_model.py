@@ -2,53 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class CrossModalAttention(nn.Module):
-    """跨模态注意力融合"""
-    def __init__(self, rgb_dim=512, depth_dim=256):
-        super().__init__()
-        
-        # 通道注意力
-        self.rgb_channel_att = nn.Sequential(
-            nn.Linear(rgb_dim, rgb_dim // 16),
-            nn.ReLU(),
-            nn.Linear(rgb_dim // 16, rgb_dim),
-            nn.Sigmoid()
-        )
-        
-        self.depth_channel_att = nn.Sequential(
-            nn.Linear(depth_dim, depth_dim // 16),
-            nn.ReLU(),
-            nn.Linear(depth_dim // 16, depth_dim),
-            nn.Sigmoid()
-        )
-        
-        # 跨模态权重
-        self.modal_weight = nn.Sequential(
-            nn.Linear(rgb_dim + depth_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 2),
-            nn.Softmax(dim=1)
-        )
-        
-    def forward(self, rgb_feat, depth_feat):
-        # 通道注意力
-        rgb_att = self.rgb_channel_att(rgb_feat)
-        depth_att = self.depth_channel_att(depth_feat)
-        
-        rgb_enhanced = rgb_feat * rgb_att
-        depth_enhanced = depth_feat * depth_att
-        
-        # 计算模态权重
-        combined = torch.cat([rgb_enhanced, depth_enhanced], dim=1)
-        weights = self.modal_weight(combined)
-        
-        # 加权融合
-        rgb_weighted = rgb_enhanced * weights[:, 0:1]
-        depth_weighted = depth_enhanced * weights[:, 1:2]
-        
-        return torch.cat([rgb_weighted, depth_weighted], dim=1)
-
 class DepthFusionCNN(nn.Module):
     """
     双流深度融合网络
@@ -86,33 +39,27 @@ class DepthFusionCNN(nn.Module):
         
         # ========== 融合层 ==========
         if fusion_method == 'concat':
-            fusion_dim = 512 + 256
-            
+            fusion_dim = 512 + 256  # RGB(512) + Depth(256)
         elif fusion_method == 'add':
-            # 投影到相同维度
-            self.depth_projection = nn.Sequential(
-                nn.Linear(256, 512),
-                nn.ReLU(),
-                nn.BatchNorm1d(512)
-            )
+            # 需要将深度特征映射到512维
+            self.depth_projection = nn.Linear(256, 512)
             fusion_dim = 512
-            
         elif fusion_method == 'attention':
-            # 使用改进的注意力
-            self.cross_attention = CrossModalAttention(512, 256)
+            # 注意力融合
+            self.attention = nn.Sequential(
+                nn.Linear(512 + 256, 384),
+                nn.ReLU(),
+                nn.Linear(384, 2),  # 2个权重：RGB和Depth
+                nn.Softmax(dim=1)
+            )
             fusion_dim = 512 + 256
-
-        # ========== 改进的回归头 ==========
+        
+        # ========== 回归头 ==========
         self.regressor = nn.Sequential(
             nn.Dropout(dropout_rate),
-            nn.Linear(fusion_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(fusion_dim, 256),
             nn.ReLU(),
             nn.Dropout(dropout_rate / 2),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate / 3),
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
@@ -163,7 +110,7 @@ class DepthFusionCNN(nn.Module):
         rgb_feat = self.rgb_conv3(rgb_feat)
         rgb_feat = self.rgb_conv4(rgb_feat)
         rgb_feat = self.rgb_conv5(rgb_feat)
-        rgb_feat = self.global_pool(rgb_feat).view(rgb_feat.size(0), -1)
+        rgb_feat = self.global_pool(rgb_feat).view(rgb_feat.size(0), -1)  # (B, 512)
         
         # 深度分支
         depth_feat = self.depth_conv1(depth)
@@ -171,25 +118,31 @@ class DepthFusionCNN(nn.Module):
         depth_feat = self.depth_conv3(depth_feat)
         depth_feat = self.depth_conv4(depth_feat)
         depth_feat = self.depth_conv5(depth_feat)
-        depth_feat = self.global_pool(depth_feat).view(depth_feat.size(0), -1)
+        depth_feat = self.global_pool(depth_feat).view(depth_feat.size(0), -1)  # (B, 256)
         
         # 特征融合
         if self.fusion_method == 'concat':
             fused = torch.cat([rgb_feat, depth_feat], dim=1)
         
         elif self.fusion_method == 'add':
-            depth_feat_projected = self.depth_projection(depth_feat)
-            fused = rgb_feat + depth_feat_projected
+            depth_feat = self.depth_projection(depth_feat)
+            fused = rgb_feat + depth_feat
         
         elif self.fusion_method == 'attention':
-            fused = self.cross_attention(rgb_feat, depth_feat)
+            # 计算注意力权重
+            combined = torch.cat([rgb_feat, depth_feat], dim=1)
+            weights = self.attention(combined)  # (B, 2)
+            
+            # 加权融合
+            rgb_weighted = rgb_feat * weights[:, 0:1]
+            depth_weighted = depth_feat * weights[:, 1:2]
+            fused = torch.cat([rgb_weighted, depth_weighted], dim=1)
         
         # 回归预测
         output = self.regressor(fused)
         
-        # 后处理：确保非负且在合理范围
-        output = torch.clamp(output, min=0, max=2000)
-        
+        # 不再使用ReLU，让模型自由学习
+        # 训练时会学会输出正值
         return output
 
 
@@ -197,25 +150,3 @@ def count_parameters(model):
     """计算参数量"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-# 测试
-if __name__ == '__main__':
-    # 测试三种融合方法
-    for method in ['concat', 'add', 'attention']:
-        print(f"\n测试融合方法: {method}")
-        print("="*50)
-        
-        model = DepthFusionCNN(fusion_method=method, dropout_rate=0.5)
-        num_params = count_parameters(model)
-        print(f"参数量: {num_params:,}")
-        
-        # 模拟输入
-        batch_size = 4
-        rgb = torch.randn(batch_size, 3, 224, 224)
-        depth = torch.randn(batch_size, 1, 224, 224)
-        
-        # 前向传播
-        output = model(rgb, depth)
-        print(f"输入 - RGB: {rgb.shape}, Depth: {depth.shape}")
-        print(f"输出: {output.shape}")
-        print(f"输出值: {output.squeeze()}")

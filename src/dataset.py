@@ -17,7 +17,7 @@ class Nutrition5kDataset(Dataset):
         transform: 图像变换
         use_depth: 是否使用深度图（默认False，baseline只用RGB）
     """
-    def __init__(self, csv_file, data_root, split='train', 
+    def __init__(self, csv_file, data_root, split='train',
                  transform=None, use_depth=False):
         self.df = pd.read_csv(csv_file)
         self.data_root = Path(data_root)
@@ -35,57 +35,50 @@ class Nutrition5kDataset(Dataset):
     def __len__(self):
         return len(self.df)
     
-
-
     def __getitem__(self, idx):
+        # 获取样本信息
         row = self.df.iloc[idx]
         dish_id = row['ID']
-        
-        # 加载RGB
+
+        # 加载RGB图像
         rgb_path = self.rgb_dir / dish_id / 'rgb.png'
         rgb = Image.open(rgb_path).convert('RGB')
-        
+
+        # 应用变换
         if self.transform:
             rgb = self.transform(rgb)
-        
+
+        # 准备返回值
         sample = {
             'image': rgb,
             'dish_id': dish_id
         }
-        
+
+        # 如果是训练集，添加标签
         if 'Value' in row:
             sample['calories'] = torch.tensor(row['Value'], dtype=torch.float32)
-        
-        # 加载深度图（改进版本）
+
+        # 加载深度图
         if self.use_depth:
             depth_path = self.depth_dir / dish_id / 'depth_raw.png'
-            
-            try:
-                depth = Image.open(depth_path)
-                depth_array = np.array(depth, dtype=np.float32)
-                
-                # 先resize再归一化
-                depth_pil = Image.fromarray(depth_array, mode='F')
-                depth_resized = depth_pil.resize((224, 224), Image.BILINEAR)
-                depth_array = np.array(depth_resized, dtype=np.float32)
-                
-                # 改进归一化：基于数据集统计
-                depth_array = depth_array / 10000.0  # 转为米
-                depth_array = np.clip(depth_array, 0, 0.7)  # 裁剪异常值
-                
-                # 标准化到[-1, 1]范围
-                depth_mean = 0.35  # 估计的深度均值
-                depth_std = 0.15   # 估计的深度标准差
-                depth_array = (depth_array - depth_mean) / depth_std
-                
-                depth_tensor = torch.from_numpy(depth_array).unsqueeze(0).float()
-                
-            except Exception as e:
-                print(f"Warning: Failed to load depth for {dish_id}: {e}")
-                depth_tensor = torch.zeros(1, 224, 224, dtype=torch.float32)
-            
+            depth = Image.open(depth_path)
+
+            # 深度图专门处理
+            depth_array = np.array(depth, dtype=np.float32)
+
+            # 归一化到合理范围
+            depth_array = depth_array / 10000.0  # 转为米 (0-0.7米范围)
+
+            # Resize到224x224
+            depth_pil = Image.fromarray(depth_array)
+            depth_resized = depth_pil.resize((224, 224), Image.BILINEAR)
+            depth_array = np.array(depth_resized)
+
+            # 转为tensor并添加channel维度
+            depth_tensor = torch.from_numpy(depth_array).unsqueeze(0)  # (1, 224, 224)
+
             sample['depth'] = depth_tensor
-        
+
         return sample
 
 
@@ -127,7 +120,7 @@ def get_transforms(split='train', image_size=224):
         ])
 
 
-def create_dataloaders(data_root, train_csv, batch_size=32, 
+def create_dataloaders(data_root, train_csv, batch_size=32,
                        val_split=0.2, num_workers=0, image_size=224):
     """
     创建训练集和验证集的DataLoader
