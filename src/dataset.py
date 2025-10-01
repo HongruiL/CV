@@ -36,48 +36,41 @@ class Nutrition5kDataset(Dataset):
         return len(self.df)
     
     def __getitem__(self, idx):
-        # 获取样本信息
         row = self.df.iloc[idx]
         dish_id = row['ID']
 
-        # 加载RGB图像
+        # 加载RGB
         rgb_path = self.rgb_dir / dish_id / 'rgb.png'
         rgb = Image.open(rgb_path).convert('RGB')
 
-        # 应用变换
-        if self.transform:
-            rgb = self.transform(rgb)
-
-        # 准备返回值
         sample = {
-            'image': rgb,
+            'image': self.transform(rgb) if self.transform else rgb,
             'dish_id': dish_id
         }
 
-        # 如果是训练集，添加标签
         if 'Value' in row:
             sample['calories'] = torch.tensor(row['Value'], dtype=torch.float32)
 
-        # 加载深度图
+        # 深度图特殊处理
         if self.use_depth:
             depth_path = self.depth_dir / dish_id / 'depth_raw.png'
             depth = Image.open(depth_path)
 
-            # 深度图专门处理
-            depth_array = np.array(depth, dtype=np.float32)
+            # 关键：用最近邻插值resize，保持深度值的意义
+            depth = transforms.Resize(
+                (224, 224),
+                interpolation=transforms.InterpolationMode.NEAREST
+            )(depth)
 
-            # 归一化到合理范围
-            depth_array = depth_array / 10000.0  # 转为米 (0-0.7米范围)
+            # 转为numpy并归一化
+            depth = np.array(depth, dtype=np.float32)
 
-            # Resize到224x224
-            depth_pil = Image.fromarray(depth_array)
-            depth_resized = depth_pil.resize((224, 224), Image.BILINEAR)
-            depth_array = np.array(depth_resized)
+            # 检查并归一化到[0,1]
+            if depth.max() > 0:
+                depth = depth / depth.max()
 
-            # 转为tensor并添加channel维度
-            depth_tensor = torch.from_numpy(depth_array).unsqueeze(0)  # (1, 224, 224)
-
-            sample['depth'] = depth_tensor
+            depth = torch.from_numpy(depth).unsqueeze(0)  # (1, H, W)
+            sample['depth'] = depth
 
         return sample
 
